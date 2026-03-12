@@ -171,8 +171,12 @@ Function Get-RegistryKeys {
         [string]$RegKey
     )
     Write-Host "$RegKey" -ForegroundColor Cyan
-    $runKey = Get-Item -Path "$RegKey"
-    $runKey.GetValueNames() | ForEach-Object { [PSCustomObject]@{ Name = $_; Value = $runKey.GetValue($_) } } | Out-Host
+    $runKey = Get-Item -Path "$RegKey" -ErrorAction SilentlyContinue
+    if ($runKey) {
+        $runKey.GetValueNames() | ForEach-Object { [PSCustomObject]@{ Name = $_; Value = $runKey.GetValue($_) } } | Out-Host
+    } else {
+        Write-Host "  [!] Registry key not found" -ForegroundColor Yellow
+    }
 }
 
 function Get-Binary {
@@ -180,16 +184,98 @@ function Get-Binary {
     Write-Host "[+] Adding Defender exclusion for C:\Tools" -ForegroundColor Cyan
     Add-MpPreference -ExclusionPath "C:\Tools"
 
-    Write-Host "[+] Downloading Cable"
-    Invoke-WebRequest "https://github.com/logangoins/Cable/releases/download/1.1/Cable.exe" -OutFile "C:\Tools\Cable.exe"
-    Write-Host "[+] Downloading PingCastle"
-    Invoke-WebRequest "https://github.com/netwrix/pingcastle/releases/download/3.5.0.44/PingCastle_3.5.0.44.zip" -OutFile "C:\Tools\pingcastle.zip"
-    Expand-Archive "C:\Tools\pingcastle.zip" -DestinationPath "C:\Tools\pingcastle" -Force
-    Remove-Item "C:\Tools\pingcastle.zip"
-    Write-Host "[+] Downloading Certify"
-    Invoke-WebRequest "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Certify.exe" -OutFile "C:\Tools\Certify.exe"
+    Write-Host "[+] Downloading binaries in parallel..." -ForegroundColor Cyan
+    $downloads = @(
+        @{ Name = "Cable";      Url = "https://github.com/logangoins/Cable/releases/download/1.1/Cable.exe";                              Out = "C:\Tools\Cable.exe" }
+        @{ Name = "PingCastle"; Url = "https://github.com/netwrix/pingcastle/releases/download/3.5.0.44/PingCastle_3.5.0.44.zip";          Out = "C:\Tools\pingcastle.zip" }
+        @{ Name = "Certify";    Url = "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Certify.exe";                Out = "C:\Tools\Certify.exe" }
+    )
+
+    $jobs = @()
+    foreach ($dl in $downloads) {
+        Write-Host "  [>] Starting download: $($dl.Name)"
+        $jobs += Start-Job -ScriptBlock { param($url, $out) Invoke-WebRequest $url -OutFile $out } -ArgumentList $dl.Url, $dl.Out
+    }
+
+    Wait-Job $jobs | Out-Null
+    foreach ($j in $jobs) {
+        if ($j.State -eq 'Failed') {
+            Write-Host "  [!] Download job failed: $($j.ChildJobs[0].JobStateInfo.Reason)" -ForegroundColor Red
+        }
+        Remove-Job $j
+    }
+
+    # Post-processing: extract PingCastle
+    if (Test-Path "C:\Tools\pingcastle.zip") {
+        Expand-Archive "C:\Tools\pingcastle.zip" -DestinationPath "C:\Tools\pingcastle" -Force
+        Remove-Item "C:\Tools\pingcastle.zip"
+    }
 
     Write-Host "[+] All binaries downloaded!" -ForegroundColor Green
+}
+
+function Setup-Graylog {
+    $installerPath = "C:\Tools\graylog_sidecar_installer.exe"
+
+    # Download the Sidecar installer
+    Write-Host "[+] Downloading Graylog Sidecar installer..." -ForegroundColor Cyan
+    try {
+        Invoke-WebRequest "https://github.com/Graylog2/collector-sidecar/releases/download/1.5.1/graylog_sidecar_installer_1.5.1-1.exe" -OutFile $installerPath -ErrorAction Stop
+        Write-Host "[+] Downloaded Graylog Sidecar installer" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] Failed to download Graylog Sidecar: $_" -ForegroundColor Red
+        return
+    }
+
+    # Prompt for required configuration
+    $serverUrl = Read-Host -Prompt "Enter Graylog server API URL (e.g. https://graylog.example.com:9000/api)"
+    if ([string]::IsNullOrWhiteSpace($serverUrl)) {
+        Write-Host "[!] Server URL is required. Exiting." -ForegroundColor Red
+        return
+    }
+
+    $apiToken = Read-Host -Prompt "Enter Graylog API token"
+    if ([string]::IsNullOrWhiteSpace($apiToken)) {
+        Write-Host "[!] API token is required. Exiting." -ForegroundColor Red
+        return
+    }
+
+    # Optional: custom tags
+    Write-Host "Enter Sidecar tags as comma-separated values (e.g. windows,iis), or press ENTER to skip:" -ForegroundColor Yellow
+    $tagsInput = Read-Host
+    $tagsArg = ""
+    if (-not [string]::IsNullOrWhiteSpace($tagsInput)) {
+        $tagList = ($tagsInput -split ',' | ForEach-Object { "`"$($_.Trim())`"" }) -join ','
+        $tagsArg = "-TAGS=[$tagList]"
+    }
+
+    # Run silent install
+    Write-Host "[+] Installing Graylog Sidecar (silent)..." -ForegroundColor Cyan
+    $installArgs = "/S -SERVERURL=$serverUrl -APITOKEN=$apiToken"
+    if ($tagsArg) { $installArgs += " $tagsArg" }
+
+    $process = Start-Process -FilePath $installerPath -ArgumentList $installArgs -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+        Write-Host "[!] Installer exited with code $($process.ExitCode)" -ForegroundColor Red
+        return
+    }
+    Write-Host "[+] Sidecar installed!" -ForegroundColor Green
+
+    # Register and start the service
+    $sidecarExe = "C:\Program Files\Graylog\sidecar\graylog-sidecar.exe"
+    if (-not (Test-Path $sidecarExe)) {
+        Write-Host "[!] graylog-sidecar.exe not found at expected path. Check installation." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "[+] Registering Sidecar service..." -ForegroundColor Cyan
+    & $sidecarExe -service install
+    Write-Host "[+] Starting Sidecar service..." -ForegroundColor Cyan
+    & $sidecarExe -service start
+
+    Write-Host "[+] Graylog Sidecar is installed and running!" -ForegroundColor Green
+    Write-Host "[+] Config file: C:\Program Files\Graylog\sidecar\sidecar.yml" -ForegroundColor Cyan
+    Write-Host "[+] Verify in Graylog UI under System > Sidecars" -ForegroundColor Cyan
 }
 
 function Reset-AllUserPasswords {
@@ -311,6 +397,17 @@ function Reset-AllUserPasswords {
     Write-Host "Passwords are saved at: $csvPath" -ForegroundColor Green
 }
 
+function Get-SystemInformer {
+    Write-Host "[+] Downloading System Informer..." -ForegroundColor Cyan
+    try {
+        Invoke-WebRequest "https://phoenixnap.dl.sourceforge.net/project/systeminformer/systeminformer-3.2.25011-release-setup.exe?viasf=1" -OutFile "C:\Tools\SystemInformer.exe" -ErrorAction Stop
+        Write-Host "[+] Downloaded System Informer to C:\Tools\SystemInformer.exe" -ForegroundColor Green
+        Write-Host "[+] Run C:\Tools\SystemInformer.exe to install" -ForegroundColor Cyan
+    } catch {
+        Write-Host "[!] Failed to download System Informer: $_" -ForegroundColor Red
+    }
+}
+
 
 function Get-Tools {
     New-Item -Path C:\ -Name "Tools" -ItemType Directory -Force > $null
@@ -326,24 +423,46 @@ function Get-Tools {
     Set-Acl -Path "C:\Tools" -AclObject $acl
     Write-Host "[+] Locked down C:\Tools - Administrators and SYSTEM only" -ForegroundColor Cyan
 
-    Write-Host "[+] Collecting tools..."
-    Write-Host "[+] Downloading SystemInformer"
-    Invoke-WebRequest https://phoenixnap.dl.sourceforge.net/project/systeminformer/systeminformer-3.2.25011-release-setup.exe?viasf=1 -OutFile "C:\Tools\SystemInformer.exe"
-    Write-Host "[+] Downloading Autoruns"
-    Invoke-WebRequest https://download.sysinternals.com/files/Autoruns.zip -OutFile "C:\Tools\Autoruns.zip"
-    Write-Host "[+] Downloading Sysmon"
-    Invoke-WebRequest https://download.sysinternals.com/files/Sysmon.zip -OutFile "C:\Tools\Sysmon.zip"
-    Write-Host "[+] Downloading Firefox"
-    Invoke-WebRequest "https://download.mozilla.org/?product=firefox-stub&os=win&lang=en-US" -OutFile "C:\Tools\FirefoxInstaller.exe"
-    Write-Host "[+] Downloading LDAP Firewall"
-    Invoke-WebRequest https://github.com/zeronetworks/ldapfw/releases/download/v1.0.0/ldapfw_v1.0.0-x64.zip -OutFile "C:\Tools\ldapfw.zip"
-    Write-Host "[+] Downloading Account Lockout Tools"
-    Invoke-WebRequest "https://download.microsoft.com/download/1/f/0/1f0e9569-3350-4329-b443-822976f29284/ALTools.exe" -OutFile "C:\Tools\ALTools.exe"
-    Invoke-WebRequest "https://github.com/deryavuz1/UTSA_CCDC_Team/raw/refs/heads/main/Windows/sysmonmsix.exe" -OutFile "C:\Tools\sysint.exe"
+    Write-Host "[+] Downloading all tools in parallel..." -ForegroundColor Cyan
 
-    Write-Host "[+] Finished downloading tools!" -ForegroundColor Green
-    Write-Host "Installing SysInternals"
-    Invoke-WebRequest "https://raw.githubusercontent.com/deryavuz1/UTSA_CCDC_Team/refs/heads/main/Windows/sysmon-config.xml" -OutFile "C:\Tools\sysmon-config.xml"
+    # Check for sysmon-config.xml next to the script before downloading
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $localSysmonConfig = Join-Path $scriptDir "sysmon-config.xml"
+
+    $downloads = @(
+        @{ Name = "Autoruns";       Url = "https://download.sysinternals.com/files/Autoruns.zip";                                                              Out = "C:\Tools\Autoruns.zip" }
+        @{ Name = "Sysmon";         Url = "https://download.sysinternals.com/files/Sysmon.zip";                                                                Out = "C:\Tools\Sysmon.zip" }
+        @{ Name = "Firefox";        Url = "https://download.mozilla.org/?product=firefox-stub&os=win&lang=en-US";                                              Out = "C:\Tools\FirefoxInstaller.exe" }
+        @{ Name = "LDAP Firewall";  Url = "https://github.com/zeronetworks/ldapfw/releases/download/v1.0.0/ldapfw_v1.0.0-x64.zip";                            Out = "C:\Tools\ldapfw.zip" }
+        @{ Name = "ALTools";        Url = "https://download.microsoft.com/download/1/f/0/1f0e9569-3350-4329-b443-822976f29284/ALTools.exe";                    Out = "C:\Tools\ALTools.exe" }
+    )
+
+    # Only download sysmon-config if not found locally
+    if (Test-Path $localSysmonConfig) {
+        Write-Host "  [+] Found sysmon-config.xml locally at $localSysmonConfig - copying" -ForegroundColor Green
+        Copy-Item $localSysmonConfig "C:\Tools\sysmon-config.xml" -Force
+    } else {
+        Write-Host "  [~] sysmon-config.xml not found locally - will download" -ForegroundColor Yellow
+        $downloads += @{ Name = "Sysmon Config"; Url = "https://raw.githubusercontent.com/SouthwestCCDC/2026-Regionals-Shared/tree/main/The%20University%20of%20Texas%20at%20San%20Antonio/refs/heads/main/2026_Windows/sysmon-config.xml"; Out = "C:\Tools\sysmon-config.xml" }
+    }
+
+    $jobs = @()
+    foreach ($dl in $downloads) {
+        Write-Host "  [>] Starting download: $($dl.Name)"
+        $jobs += Start-Job -ScriptBlock { param($url, $out) Invoke-WebRequest $url -OutFile $out } -ArgumentList $dl.Url, $dl.Out
+    }
+
+    Write-Host "[+] Waiting for all downloads to complete..." -ForegroundColor Cyan
+    Wait-Job $jobs | Out-Null
+    $failCount = 0
+    foreach ($j in $jobs) {
+        if ($j.State -eq 'Failed') {
+            Write-Host "  [!] Download failed: $($j.ChildJobs[0].JobStateInfo.Reason)" -ForegroundColor Red
+            $failCount++
+        }
+        Remove-Job $j
+    }
+    Write-Host "[+] Downloads finished ($failCount failure(s))" -ForegroundColor Green
 
     Write-Host "[+] Expanding archives"
     Expand-Archive -Path "C:\Tools\Autoruns.zip" -DestinationPath "C:\Tools\Autoruns" -Force
@@ -473,7 +592,7 @@ function Enumerate {
     Write-Output "==========END PROCESSES=========="
 
     Write-Output "==========START SERVICES=========="
-    $svc = Get-WmiObject Win32_Service | Select-Object Name, PathName
+    $svc = Get-CimInstance Win32_Service | Select-Object Name, PathName
     Write-Output $svc
     Write-Output "==========END SERVICES=========="
 
@@ -496,7 +615,6 @@ function Enumerate {
     $tasks = Get-ScheduledTask | ForEach-Object {
         $taskName = $_.TaskName
         $taskPath = $_.TaskPath
-        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -TaskPath $taskPath
         $execPath = ($_ | Select-Object -ExpandProperty Actions).Execute
 
         [PSCustomObject]@{
@@ -553,18 +671,18 @@ function Guest-Service {
     # Prompt for password input for the Guest account
     $password = Read-Host -AsSecureString "Enter the password for the $username account"
 
-    # Convert the secure password to plain text for WMI interaction
+    # Convert the secure password to plain text for CIM interaction
     $passwordPlainText = [System.Net.NetworkCredential]::new('', $password).Password
 
     # Prompt for the service name
     $serviceName = Read-Host "Enter the service name to manage"
 
-    # Use WMI to get the service object
-    $service = Get-WmiObject -Class Win32_Service -Filter "Name = '$serviceName'"
+    # Use CIM to get the service object
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name = '$serviceName'"
 
     if ($service) {
-        # Change the service credentials using WMI
-        $service.change($null, $null, $null, $null, $null, $null, $username, $passwordPlainText) > $null
+        # Change the service credentials using CIM
+        Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ StartName = $username; StartPassword = $passwordPlainText } > $null
 
         # Restart the service
         Restart-Service -Name $serviceName -Force # this will fail if u put random creds and its ok
@@ -582,17 +700,23 @@ function Guest-Service {
 function Phase2 {
     Write-Output "Starting Phase 2!"
     Read-Host -Prompt "Stopping services: WebClient, Spooler, WinRM"
-    Get-Service "WebClient" | Stop-Service # MAY NOT BE PRESENT ON SOME MACHINES
+    Get-Service "WebClient" -ErrorAction SilentlyContinue | Stop-Service -ErrorAction SilentlyContinue
     Get-Service "Spooler" | Stop-Service
     Get-Service "WinRM" | Stop-Service
-    Read-Host -Prompt "Press enter to start Defender services" # ALSO NOT WORKING
+    Read-Host -Prompt "Press enter to start Defender services"
     Get-Service "WinDefend" | Start-Service # Microsoft Defender Antivirus Service - MsMpEng.exe
     Get-Service "WdNisSvc" | Start-Service # Microsoft Defender Antivirus Network Inspection Service - NisSrv.exe
-    Get-Service "MdCoreSvc" | Start-Service # Microsoft Defender Core Service - MpDefenderCoreService.exe # MAY NOT BE PRESENT
+    Get-Service "MdCoreSvc" -ErrorAction SilentlyContinue | Start-Service -ErrorAction SilentlyContinue # Microsoft Defender Core Service - may not be present
     Get-Service "SecurityHealthService" | Start-Service # Windows Security Service - SecurityHealthService.exe
-    Get-Service "Sense" | Start-Service # Windows Defender Advanced Threat Protection Service - MsSense.exe # WILL NOT WORK IF YOU DO NOT HAVE MDE INSTALLED
-    Write-Output "Current Exclusions: (Path = Folder & File, Extension = File type, Process = Process Binary"
-    Get-MpPreference | Select-Object -ExpandProperty ExclusionPath,ExclusionProcess,ExclusionExtension
+    Get-Service "Sense" -ErrorAction SilentlyContinue | Start-Service -ErrorAction SilentlyContinue # Windows Defender ATP - requires MDE
+    Write-Output "Current Exclusions: (Path = Folder & File, Extension = File type, Process = Process Binary)"
+    $mpPref = Get-MpPreference
+    Write-Host "  ExclusionPath:" -ForegroundColor Cyan
+    $mpPref.ExclusionPath | ForEach-Object { Write-Host "    $_" }
+    Write-Host "  ExclusionProcess:" -ForegroundColor Cyan
+    $mpPref.ExclusionProcess | ForEach-Object { Write-Host "    $_" }
+    Write-Host "  ExclusionExtension:" -ForegroundColor Cyan
+    $mpPref.ExclusionExtension | ForEach-Object { Write-Host "    $_" }
     $answer = Read-Host -Prompt "Do you want to remove exclusions? yes/no"
     if ($answer -eq "yes")
     {
@@ -627,29 +751,29 @@ function Phase2 {
     Read-Host -Prompt "Press enter to add ASR rules & restart Defender"
     Add-MpPreference -AttackSurfaceReductionRules_Ids 56a863a9-875e-4185-98a7-b882c64b5ce5 -AttackSurfaceReductionRules_Actions Enabled # Block abuse of exploited vulnerable signed drivers
     Add-MpPreference -AttackSurfaceReductionRules_Ids 7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c -AttackSurfaceReductionRules_Actions Enabled # Block Adobe Reader from creating child processes
-    Add-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EfC-AADCAD5F3C50688A -AttackSurfaceReductionRules_Actions Enabled # Block all Office applications from creating child processes
+    Add-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EFC-AADC-AD5F3C50688A -AttackSurfaceReductionRules_Actions Enabled # Block all Office applications from creating child processes
     Add-MpPreference -AttackSurfaceReductionRules_Ids 9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2 -AttackSurfaceReductionRules_Actions Enabled # Block credential stealing from the Windows local security authority subsystem (lsass.exe)
     Add-MpPreference -AttackSurfaceReductionRules_Ids BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550 -AttackSurfaceReductionRules_Actions Enabled # Block executable content from email client and webmail
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 01443614-CD74-433A-B99E2ECDC07BFC25 -AttackSurfaceReductionRules_Actions Enabled # Block executable files from running unless they meet a prevalence, age, or trusted list criterion
-    Add-MpPreference -AttackSurfaceReductionRules_Ids 5BEB7EFE-FD9A-4556801D275E5FFC04CC -AttackSurfaceReductionRules_Actions Enabled # Block execution of potentially obfuscated scripts
+    Add-MpPreference -AttackSurfaceReductionRules_Ids 01443614-CD74-433A-B99E-2ECDC07BFC25 -AttackSurfaceReductionRules_Actions Enabled # Block executable files from running unless they meet a prevalence, age, or trusted list criterion
+    Add-MpPreference -AttackSurfaceReductionRules_Ids 5BEB7EFE-FD9A-4556-801D-275E5FFC04CC -AttackSurfaceReductionRules_Actions Enabled # Block execution of potentially obfuscated scripts
     Add-MpPreference -AttackSurfaceReductionRules_Ids D3E037E1-3EB8-44C8-A917-57927947596D -AttackSurfaceReductionRules_Actions Enabled # Block JavaScript or VBScript from launching downloaded executable content
     Add-MpPreference -AttackSurfaceReductionRules_Ids 3B576869-A4EC-4529-8536-B80A7769E899 -AttackSurfaceReductionRules_Actions Enabled # Block Office applications from creating executable content
     Add-MpPreference -AttackSurfaceReductionRules_Ids 75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84 -AttackSurfaceReductionRules_Actions Enabled # Block Office applications from injecting code into other processes
     Add-MpPreference -AttackSurfaceReductionRules_Ids 26190899-1602-49e8-8b27-eb1d0a1ce869 -AttackSurfaceReductionRules_Actions Enabled # Block Office communication application from creating child processes
     Add-MpPreference -AttackSurfaceReductionRules_Ids e6db77e5-3df2-4cf1-b95a-636979351e5b -AttackSurfaceReductionRules_Actions Enabled # Block persistence through WMI event subscription, * File and folder exclusions not supported.
-    Add-MpPreference -AttackSurfaceReductionRules_Ids D1E49AAC-8F56-4280-B9BA993A6D77406C -AttackSurfaceReductionRules_Actions Enabled # Block process creations originating from PSExec and WMI commands
+    Add-MpPreference -AttackSurfaceReductionRules_Ids D1E49AAC-8F56-4280-B9BA-993A6D77406C -AttackSurfaceReductionRules_Actions Enabled # Block process creations originating from PSExec and WMI commands
     Add-MpPreference -AttackSurfaceReductionRules_Ids 33ddedf1-c6e0-47cb-833e-de6133960387 -AttackSurfaceReductionRules_Actions Enabled # Block rebooting machine in Safe Mode (preview)
     Add-MpPreference -AttackSurfaceReductionRules_Ids B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4 -AttackSurfaceReductionRules_Actions Enabled # Block untrusted and unsigned processes that run from USB
     Add-MpPreference -AttackSurfaceReductionRules_Ids c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb -AttackSurfaceReductionRules_Actions Enabled # Block use of copied or impersonated system tools (preview)
     Add-MpPreference -AttackSurfaceReductionRules_Ids a8f5898e-1dc8-49a9-9878-85004b8a61e6 -AttackSurfaceReductionRules_Actions Enabled # Block Webshell creation for Servers
     Add-MpPreference -AttackSurfaceReductionRules_Ids 92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B -AttackSurfaceReductionRules_Actions Enabled # Block Win32 API calls from Office macros
-    Add-MpPreference -AttackSurfaceReductionRules_Ids C1DB55AB-C21A-4637-BB3FA12568109D35 -AttackSurfaceReductionRules_Actions Enabled # Use advanced protection against ransomware
+    Add-MpPreference -AttackSurfaceReductionRules_Ids C1DB55AB-C21A-4637-BB3F-A12568109D35 -AttackSurfaceReductionRules_Actions Enabled # Use advanced protection against ransomware
     #Restart-Service WinDefend # YOU CANNOT RESTART WINDEFEND. REBOOT HERE IS REQUIRED
     Update-MpSignature -AsJob
 
     Read-Host -Prompt "Press enter to enable LSA protections"
-    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 1
-    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPLBoot" -Value 1
+    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 1 -PropertyType DWord -Force
+    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPLBoot" -Value 1 -PropertyType DWord -Force
 
     Write-Host "[!] Finished Phase2!!`n" -ForegroundColor Green
     Write-Host "Things to do:`n* Run 'svcstuff'`n* Begin firewall rules!" -ForegroundColor Yellow
@@ -668,20 +792,20 @@ function Generate-WDAC {
     $pdPolicy=$PolicyPath+"pd.xml"
     $toolsPolicy=$PolicyPath+"tools.xml"
     $src = "$env:windir\schemas\CodeIntegrity\ExamplePolicies\DefaultWindows_enforced.xml"
-    $dst = "$env:USERPROFILE\Desktop\DefaultWindows_Audit.xml"
+    $dst = "$env:USERPROFILE\Desktop\DefaultWindows_Enforced.xml"
 
-    # --- NEW: Copy local file if it exists, otherwise download from GitHub ---
+    # --- Copy local file if it exists, otherwise download from GitHub ---
     if (Test-Path $src) {
-        Write-Host "[+] Found DefaultWindows_Audit.xml locally, copying..." -ForegroundColor Cyan
+        Write-Host "[+] Found DefaultWindows_Enforced.xml locally, copying..." -ForegroundColor Cyan
         Copy-Item $src $dst -Force
     } else {
-        Write-Host "[!] DefaultWindows_Audit.xml not found locally. Downloading from GitHub..." -ForegroundColor Yellow
-        $downloadUrl = "https://raw.githubusercontent.com/deryavuz1/UTSA_CCDC_Team/refs/heads/main/Windows/DefaultWindows_Audit.xml"
+        Write-Host "[!] DefaultWindows_Enforced.xml not found locally. Downloading from GitHub..." -ForegroundColor Yellow
+        $downloadUrl = "google.com"
         try {
             Invoke-WebRequest -Uri $downloadUrl -OutFile $dst -UseBasicParsing -ErrorAction Stop
-            Write-Host "[+] Successfully downloaded DefaultWindows_Audit.xml" -ForegroundColor Green
+            Write-Host "[+] Successfully downloaded base policy" -ForegroundColor Green
         } catch {
-            Write-Host "[!] Failed to download DefaultWindows_Audit.xml: $_" -ForegroundColor Red
+            Write-Host "[!] Failed to download base policy: $_" -ForegroundColor Red
             Write-Host "[!] Cannot continue without a base policy. Exiting." -ForegroundColor Red
             return
         }
@@ -697,20 +821,83 @@ function Generate-WDAC {
     }
 
     Write-Host "[+] Generating policy..."
-    $pf64 = Start-Job -ScriptBlock { param($pf64Policy) New-CIPolicy -FilePath $pf64Policy -Level FilePublisher -Fallback Hash,FileName -ScanPath "C:\Program Files\" -UserPEs -OmitPaths "C:\Program Files\WindowsApps\" } -ArgumentList $pf64Policy
-    $pf32 = Start-Job -ScriptBlock { param($pf32Policy) New-CIPolicy -FilePath $pf32Policy -Level FilePublisher -Fallback Hash,FileName -ScanPath "C:\Program Files (x86)\" -UserPEs } -ArgumentList $pf32Policy
-    $pd = Start-Job -ScriptBlock { param($pdPolicy) New-CIPolicy -FilePath $pdPolicy -Level FilePublisher -Fallback Hash,FileName -ScanPath "C:\ProgramData\" -UserPEs } -ArgumentList $pdPolicy
-    $tools = Start-Job -ScriptBlock { param($toolsPolicy) New-CIPolicy -FilePath $toolsPolicy -Level FilePublisher -Fallback Hash -ScanPath "C:\Tools\" -UserPEs } -ArgumentList $toolsPolicy
+    $scanStart = Get-Date
+    $pf64 = Start-Job -Name "pf64 (Program Files)" -ScriptBlock { param($pf64Policy) New-CIPolicy -FilePath $pf64Policy -Level FilePublisher -Fallback Hash,FileName -ScanPath "C:\Program Files\" -UserPEs -OmitPaths "C:\Program Files\WindowsApps\" } -ArgumentList $pf64Policy
+    $pf32 = Start-Job -Name "pf32 (Program Files x86)" -ScriptBlock { param($pf32Policy) New-CIPolicy -FilePath $pf32Policy -Level FilePublisher -Fallback Hash,FileName -ScanPath "C:\Program Files (x86)\" -UserPEs } -ArgumentList $pf32Policy
+    $pd = Start-Job -Name "pd (ProgramData)" -ScriptBlock { param($pdPolicy) New-CIPolicy -FilePath $pdPolicy -Level FilePublisher -Fallback Hash,FileName -ScanPath "C:\ProgramData\" -UserPEs } -ArgumentList $pdPolicy
+    $tools = Start-Job -Name "tools (C:\Tools)" -ScriptBlock { param($toolsPolicy) New-CIPolicy -FilePath $toolsPolicy -Level FilePublisher -Fallback Hash -ScanPath "C:\Tools\" -UserPEs } -ArgumentList $toolsPolicy
 
-    if ((Get-WindowsFeature Web-Server).InstallState -eq "Installed") {
-        Write-Host "[!] Detected an IIS Server! Adjusting WDAC policy creation..." -ForegroundColor Yellow
-        $iis = Start-Job -ScriptBlock { param($IISPolicy) New-CIPolicy -FilePath $IISPolicy -Level FilePublisher -Fallback Hash,Filename -ScanPath "C:\Windows\System32\inetsrv\" } -ArgumentList $IISPolicy
+    # Detect IIS - use Get-WindowsFeature on Server, fall back to path check on workstations
+    $iisDetected = $false
+    try {
+        if ((Get-WindowsFeature Web-Server -ErrorAction Stop).InstallState -eq "Installed") { $iisDetected = $true }
+    } catch {
+        # Get-WindowsFeature not available (workstation) - check for inetsrv directory instead
+        if (Test-Path "C:\Windows\System32\inetsrv\w3wp.exe") { $iisDetected = $true }
     }
-    $drivers = Start-Job -ScriptBlock { param($DriversPolicy) New-CIPolicy -FilePath $DriversPolicy -Level SignedVersion -Fallback FilePublisher,Hash -ScanPath "C:\Windows\System32\drivers\" } -ArgumentList $DriversPolicy
-    
-    Wait-Job $pf64,$pf32,$pd,$drivers,$tools
-    if ($iis) { Wait-Job $iis ; Remove-Job $iis }
+    if ($iisDetected) {
+        Write-Host "[!] Detected an IIS Server! Adjusting WDAC policy creation..." -ForegroundColor Yellow
+        $iis = Start-Job -Name "iis (inetsrv)" -ScriptBlock { param($IISPolicy) New-CIPolicy -FilePath $IISPolicy -Level FilePublisher -Fallback Hash,Filename -ScanPath "C:\Windows\System32\inetsrv\" } -ArgumentList $IISPolicy
+    }
+    $drivers = Start-Job -Name "drivers (System32\drivers)" -ScriptBlock { param($DriversPolicy) New-CIPolicy -FilePath $DriversPolicy -Level SignedVersion -Fallback FilePublisher,Hash -ScanPath "C:\Windows\System32\drivers\" } -ArgumentList $DriversPolicy
+
+    # Build the full job list for progress monitoring
+    $jobIds = @($pf64.Id, $pf32.Id, $pd.Id, $tools.Id, $drivers.Id)
+    $jobNames = @{ $pf64.Id = $pf64.Name; $pf32.Id = $pf32.Name; $pd.Id = $pd.Name; $tools.Id = $tools.Name; $drivers.Id = $drivers.Name }
+    if ($iis) { $jobIds += $iis.Id; $jobNames[$iis.Id] = $iis.Name }
+    $completedIds = @{}
+
+    Write-Host "[+] Waiting for $($jobIds.Count) scan jobs to complete..." -ForegroundColor Cyan
+    while ($true) {
+        # Force fresh state read via Get-Job
+        $freshJobs = $jobIds | ForEach-Object { Get-Job -Id $_ }
+        $stillRunning = $freshJobs | Where-Object { $_.State -eq 'Running' }
+
+        foreach ($fj in $freshJobs) {
+            if ($fj.State -ne 'Running' -and -not $completedIds.ContainsKey($fj.Id)) {
+                $elapsed = "{0:mm\:ss}" -f ((Get-Date) - $scanStart)
+                if ($fj.State -eq 'Completed') {
+                    Write-Host "  [+] $($jobNames[$fj.Id]) complete ($elapsed)" -ForegroundColor Green
+                } else {
+                    Write-Host "  [!] $($jobNames[$fj.Id]) $($fj.State) ($elapsed)" -ForegroundColor Red
+                }
+                $completedIds[$fj.Id] = $true
+            }
+        }
+
+        if (-not $stillRunning) { break }
+
+        $elapsed = "{0:mm\:ss}" -f ((Get-Date) - $scanStart)
+        $runningNames = ($stillRunning | ForEach-Object { $jobNames[$_.Id] }) -join ', '
+        Write-Host "  [~] $elapsed elapsed - still waiting on $($stillRunning.Count) job(s): $runningNames" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 15
+    }
+    $totalElapsed = "{0:mm\:ss}" -f ((Get-Date) - $scanStart)
+    Write-Host "[+] All scans finished in $totalElapsed" -ForegroundColor Green
+
+    if ($iis) { Remove-Job $iis }
+
+    # Check for job failures before continuing
+    $failedJobs = @()
+    foreach ($job in @($pf64,$pf32,$pd,$drivers,$tools)) {
+        $jobResult = Receive-Job $job -ErrorAction SilentlyContinue
+        if ((Get-Job -Id $job.Id).State -eq 'Failed') {
+            $failedJobs += $job.Name
+            Write-Host "[!] Scan job '$($job.Name)' failed: $($job.ChildJobs[0].JobStateInfo.Reason)" -ForegroundColor Red
+        }
+    }
     Remove-Job $pf64,$pf32,$pd,$drivers,$tools
+
+    # Build list of policy files that actually exist for merging
+    $policiesToMerge = @($DefaultWindowsPolicy)
+    foreach ($p in @($pf64Policy, $pf32Policy, $pdPolicy, $DriversPolicy, $toolsPolicy)) {
+        if (Test-Path $p) {
+            $policiesToMerge += $p
+        } else {
+            Write-Host "[!] Skipping missing scan policy: $p" -ForegroundColor Yellow
+        }
+    }
+
     $additional_blocks = New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\vssadmin.exe -Deny
     $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\vssuirun.exe -Deny
     $additional_blocks += New-CIPolicyRule -Level Hash -Fallback FileName -DriverFilePath C:\Windows\System32\ntdsutil.exe -Deny
@@ -723,27 +910,26 @@ function Generate-WDAC {
     Write-Host "[+] Generated policies!" -ForegroundColor Green
     
     Write-Host "[+] Merging policies..."
-    Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $DefaultWindowsPolicy,$pf32Policy,$pf64Policy,$pdPolicy,$DriversPolicy,$toolsPolicy > $null
+    Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $policiesToMerge > $null
     Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $Policy -Rules $additional_blocks > $null
-    if ($iis) { Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $Policy,$IISPolicy > $null }
+    if (Test-Path $IISPolicy) { Merge-CIPolicy -OutputFilePath $Policy -PolicyPaths $Policy,$IISPolicy > $null }
     Write-Host "[+] Merged policies"
     
     Set-CIPolicyIdInfo -FilePath $Policy -PolicyName $PolicyName
     Set-CIPolicyVersion -FilePath $Policy -Version "1.0.0.0"
     Set-RuleOption -FilePath $Policy -Option 3 -Delete  # Audit Mode
     Set-RuleOption -FilePath $Policy -Option 6          # Unsigned Policy
-    Set-RuleOption -FilePath $Policy -Option 8 -Delete  # DLL enforcement
+    Set-RuleOption -FilePath $Policy -Option 8 -Delete  # Required:EV Signers
     Set-RuleOption -FilePath $Policy -Option 9          # Advanced Boot Menu
     Set-RuleOption -FilePath $Policy -Option 10         # Boot Audit on Failure
     Set-RuleOption -FilePath $Policy -Option 12         # Enforce Store Apps
 
-    # Options 14 (ISG) and 19 (Dynamic Code Security) require Server 2019+ / Win10 1903+
+    # Option 19 (Dynamic Code Security) requires Server 2019+ / Win10 1903+
     $osBuild = [System.Environment]::OSVersion.Version.Build
     if ($osBuild -ge 17763) {
-        Set-RuleOption -FilePath $Policy -Option 14     # Intelligent Security Graph
         Set-RuleOption -FilePath $Policy -Option 19     # Dynamic Code Security
     } else {
-        Write-Host "[!] Skipping options 14 and 19 - not supported on this OS (build $osBuild)" -ForegroundColor Yellow
+        Write-Host "[!] Skipping option 19 - not supported on this OS (build $osBuild)" -ForegroundColor Yellow
     }
     Write-Host "[+] Added configuration rules to policy!"
 
@@ -758,6 +944,7 @@ function Generate-WDAC {
             Write-Host "[+] Moved policy!"
             Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"} > $null
             Write-Host "[+] Refreshed policy!" -ForegroundColor Green
+            Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
         } catch {
             Write-Host "[!] Failed to copy policy! Is controlled folder access on?" -ForegroundColor Red
         }
@@ -792,4 +979,153 @@ Function Add-UsersToGroup {
             Write-Host "[-] Skill issue for user $User" -ForegroundColor Red
         }
     }
+}
+
+function win-ccdc {
+    $desktopPath = [Environment]::GetFolderPath('Desktop')
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+    # ========================
+    # Step 1: Enumerate
+    # ========================
+    Write-Host "============================================" -ForegroundColor Magenta
+    Write-Host "  STEP 1: Enumeration" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+
+    $adminPass = Read-Host -Prompt "Enter a new local Administrator password (or press ENTER to skip)"
+    $enumFile = Join-Path $desktopPath "Enumeration_$timestamp.txt"
+
+    # Start-Transcript captures both Write-Host and Write-Output to file while printing to terminal
+    Start-Transcript -Path $enumFile -Append
+    Enumerate -AdminPass $adminPass
+    Stop-Transcript
+
+    Write-Host "[+] Enumeration saved to: $enumFile" -ForegroundColor Green
+
+    # ========================
+    # Step 2: Get-Tools
+    # ========================
+    Write-Host "`n============================================" -ForegroundColor Magenta
+    Write-Host "  STEP 2: Downloading Tools" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+    Get-Tools
+
+    $installSI = Read-Host -Prompt "Do you want to download System Informer? (yes/no)"
+    if ($installSI -eq "yes") {
+        Get-SystemInformer
+    } else {
+        Write-Host "[*] Skipping System Informer" -ForegroundColor Yellow
+    }
+
+    # ========================
+    # Step 3: DC-only tasks
+    # ========================
+    $domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
+    # DomainRole 4 = Backup DC, 5 = Primary DC
+    $isDC = $domainRole -ge 4
+
+    if ($isDC) {
+        Write-Host "`n============================================" -ForegroundColor Magenta
+        Write-Host "  STEP 3: Domain Controller - Downloading Binaries" -ForegroundColor Magenta
+        Write-Host "============================================" -ForegroundColor Magenta
+        Get-Binary
+
+        # --- PingCastle ---
+        Write-Host "`n[+] Running PingCastle healthcheck..." -ForegroundColor Cyan
+        $pingCastleExe = "C:\Tools\pingcastle\PingCastle.exe"
+        if (Test-Path $pingCastleExe) {
+            Push-Location $desktopPath
+            & $pingCastleExe --healthcheck
+            Pop-Location
+            Write-Host "[+] PingCastle report saved to Desktop" -ForegroundColor Green
+        } else {
+            Write-Host "[!] PingCastle.exe not found at $pingCastleExe" -ForegroundColor Red
+        }
+
+        # --- Cable DACL ---
+        Write-Host "`n[+] Running Cable DACL enumeration..." -ForegroundColor Cyan
+        $cableExe = "C:\Tools\Cable.exe"
+        $cableOutput = Join-Path $desktopPath "Cable_DACL_$timestamp.txt"
+        if (Test-Path $cableExe) {
+            & $cableExe dacl /find | Tee-Object -FilePath $cableOutput
+            Write-Host "[+] Cable DACL output saved to: $cableOutput" -ForegroundColor Green
+        } else {
+            Write-Host "[!] Cable.exe not found at $cableExe" -ForegroundColor Red
+        }
+
+        # --- Certify ADCS ---
+        Write-Host "`n[+] Running Certify ADCS enumeration..." -ForegroundColor Cyan
+        $certifyExe = "C:\Tools\Certify.exe"
+        $certifyOutput = Join-Path $desktopPath "Certify_ADCS_$timestamp.txt"
+        if (Test-Path $certifyExe) {
+            & $certifyExe find | Tee-Object -FilePath $certifyOutput
+            Write-Host "[+] Certify ADCS output saved to: $certifyOutput" -ForegroundColor Green
+        } else {
+            Write-Host "[!] Certify.exe not found at $certifyExe" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "`n[*] Not a Domain Controller (DomainRole=$domainRole) - skipping DC-only tasks" -ForegroundColor Yellow
+    }
+
+    # ========================
+    # Step 4: Graylog Sidecar
+    # ========================
+    Write-Host "`n============================================" -ForegroundColor Magenta
+    Write-Host "  STEP 4: Graylog Sidecar Setup" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+    $setupGraylog = Read-Host -Prompt "Do you want to set up Graylog Sidecar on this machine? (yes/no)"
+    if ($setupGraylog -eq "yes") {
+        Setup-Graylog
+    } else {
+        Write-Host "[*] Skipping Graylog Sidecar setup" -ForegroundColor Yellow
+    }
+
+    # ========================
+    # Step 5: Generate WDAC
+    # ========================
+    Write-Host "`n============================================" -ForegroundColor Magenta
+    Write-Host "  STEP 5: WDAC Policy Generation" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+    Generate-WDAC
+
+    $enableWDAC = Read-Host -Prompt "Do you want to enable the WDAC policy now? (yes/no)"
+    if ($enableWDAC -eq "yes") {
+        $policyBin = Join-Path $desktopPath "SiPolicy.p7b"
+        if (Test-Path $policyBin) {
+            try {
+                Copy-Item $policyBin "C:\Windows\System32\CodeIntegrity\" -Force
+                Write-Host "[+] Copied WDAC policy to CodeIntegrity" -ForegroundColor Green
+                Invoke-CimMethod -Namespace root\Microsoft\Windows\CI -ClassName PS_UpdateAndCompareCIPolicy -MethodName Update -Arguments @{FilePath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"} > $null
+                Write-Host "[+] WDAC policy refreshed and active!" -ForegroundColor Green
+                Write-Host "[!] A REBOOT is required for WDAC enforcement to fully take effect!" -ForegroundColor Yellow
+            } catch {
+                Write-Host "[!] Failed to deploy WDAC policy: $_" -ForegroundColor Red
+                Write-Host "[!] Is controlled folder access blocking the copy?" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "[!] SiPolicy.p7b not found on Desktop - WDAC generation may have failed" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "[*] Skipping WDAC enforcement. Policy is on your Desktop if you want to deploy later." -ForegroundColor Yellow
+    }
+
+    # ========================
+    # Step 6: Phase2
+    # ========================
+    Write-Host "`n============================================" -ForegroundColor Magenta
+    Write-Host "  STEP 6: Phase 2 - Hardening" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+    Phase2
+
+    Write-Host "`n============================================" -ForegroundColor Green
+    Write-Host "  win-ccdc complete!" -ForegroundColor Green
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "Files on Desktop:" -ForegroundColor Cyan
+    Write-Host "  - Enumeration: $enumFile" -ForegroundColor Cyan
+    if ($isDC) {
+        Write-Host "  - PingCastle: Check Desktop for ad_hc_*.html report" -ForegroundColor Cyan
+        Write-Host "  - Cable DACL: $cableOutput" -ForegroundColor Cyan
+        Write-Host "  - Certify ADCS: $certifyOutput" -ForegroundColor Cyan
+    }
+    Write-Host "  - WDAC Policy: $desktopPath\SiPolicy.p7b" -ForegroundColor Cyan
 }
